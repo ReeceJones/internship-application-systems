@@ -15,8 +15,6 @@
 #include <unistd.h>
 #include <errno.h>
 
-#define ECHO_SIZE 64
-
 /*
  * References:
  * - https://en.wikipedia.org/wiki/Internet_Control_Message_Protocol#Control_messages
@@ -50,9 +48,12 @@ int main(int argc, char** argv) {
     }
     
     int ip_mode = -1;
+    int strict_recv = 0;
+    int local_check = 0;
+    unsigned long payload_size = 64;
 
     int opt = 0;
-    while ((opt = getopt(argc, argv, "46")) != -1) {
+    while ((opt = getopt(argc, argv, "46csp:")) != -1) {
         switch (opt) {
             default:
             case  '?':
@@ -76,11 +77,16 @@ int main(int argc, char** argv) {
                     return 1;  
                 }
             break;
+            case 'c':
+                local_check = 1;
+            break;
+            case 's':
+                strict_recv = 1;
+            break;
+            case 'p':
+                payload_size = atoi(optarg);
+            break;
         }
-    }
-
-    if (ip_mode == -1) {
-        ip_mode = AF_INET;
     }
 
     if (optind >= argc || optind < argc - 1) {
@@ -107,19 +113,37 @@ int main(int argc, char** argv) {
 
     struct addrinfo* node = hits;
 
-    char* s = malloc(0xff);
-    while (node != NULL) {
-        memset(s, 0, 0xff);
-        inet_ntop(node->ai_family, &(((struct sockaddr_in6*)node->ai_addr)->sin6_addr), s, 0xff);
-        printf("%s\n", s);
-        node = node->ai_next;
+    socklen_t socket_len = 0; // hits->ai_addrlen;
+    struct sockaddr* socket_server_address = NULL; // hits->ai_addr;
+    if (ip_mode != -1) {
+        while (node != NULL) {
+            if (node->ai_family == ip_mode) {
+                socket_len = node->ai_addrlen;
+                socket_server_address = node->ai_addr;
+                break;
+            }
+            node = node->ai_next;
+        }
+        if (node == NULL) {
+            fprintf(stderr, "Could not find host ip that matched requirement: %s\n",
+                    ip_mode == AF_INET ? "ipv4" : "ipv6");
+            freeaddrinfo(hits);
+            return 1;
+        }
     }
-    free(s);
+    else {
+        ip_mode = hits->ai_family;
+        socket_len = hits->ai_addrlen;
+        socket_server_address = hits->ai_addr;
+    }
 
-    ip_mode = hits->ai_family;
-
-    socklen_t socket_len = hits->ai_addrlen;
-    struct sockaddr* socket_server_address = hits->ai_addr;
+    char* resolved = malloc(0xff);
+    if (ip_mode == AF_INET) {
+        inet_ntop(node->ai_family, &(((struct sockaddr_in*)node->ai_addr)->sin_addr), resolved, 0xff);
+    }
+    else {
+        inet_ntop(node->ai_family, &(((struct sockaddr_in6*)node->ai_addr)->sin6_addr), resolved, 0xff);
+    }
 
     int protocol = ip_mode == AF_INET ? IPPROTO_ICMP : IPPROTO_ICMPV6;
 
@@ -127,17 +151,21 @@ int main(int argc, char** argv) {
     int socket_fd = socket(ip_mode, SOCK_DGRAM, protocol);
     if (socket_fd < 0) {
         fprintf(stderr, "Unable to create socket: %d.\n", errno);
+        freeaddrinfo(hits);
+        free(resolved);
         return 1;
     }
 
     unsigned int icmp_size = ip_mode == AF_INET ? sizeof(struct icmphdr)
                              : sizeof(struct icmp6_hdr);
-    icmp_size += ECHO_SIZE;
+    icmp_size += payload_size;
 
     void* icmp_blob = malloc(icmp_size);
     if (icmp_blob == NULL) {
         fprintf(stderr, "Failed to allocate memory for outgoing icmp\n");
         close(socket_fd);
+        freeaddrinfo(hits);
+        free(resolved);
         return 1;
     }
 
@@ -153,7 +181,9 @@ int main(int argc, char** argv) {
             icmp->un.echo.sequence = seq;
             icmp->un.echo.id = getpid();
             icmp->checksum = 0;
-            //icmp->checksum = internet_checksum((unsigned short*)icmp_blob, icmp_size);
+            if (local_check) {
+                icmp->checksum = internet_checksum((unsigned short*)icmp_blob, icmp_size);
+            }
         }
         else {
             struct icmp6_hdr* icmp6 = (struct icmp6_hdr*)icmp_blob;
@@ -162,7 +192,9 @@ int main(int argc, char** argv) {
             icmp6->icmp6_dataun.icmp6_un_data16[0] = getpid();
             icmp6->icmp6_dataun.icmp6_un_data16[1] = seq;
             icmp6->icmp6_cksum = 0;
-            //icmp6->icmp6_cksum = internet_checksum((unsigned short*)icmp_blob, icmp_size);
+            if (local_check) {
+                icmp6->icmp6_cksum = internet_checksum((unsigned short*)icmp_blob, icmp_size);
+            }
         }
         err = sendto(socket_fd, icmp_blob, icmp_size, 0, socket_server_address, socket_len);
         if (err <= 0) {
@@ -171,6 +203,8 @@ int main(int argc, char** argv) {
             sleep(1);
             continue;
         }
+
+        int sent = err;
 
         struct sockaddr incoming_addr = { 0 };
         socklen_t size = socket_len;
@@ -181,15 +215,21 @@ int main(int argc, char** argv) {
             dropped++;
         }
         else {
-            printf("%d bytes received from %s -> %s. "
+            if (strict_recv && sent != err) {
+                printf("(Data length mismatch: sent: %d recv: %d) ", sent, err);
+                dropped++;
+            }
+            printf("%d bytes received from %s -> %s; "
                    "icmp_seq=%ld time=%.4f dropped=%ld\\%ld\n",
-                    err, server, server, seq++, 1.0f, dropped, dropped);
+                    err, server, resolved, seq, 1.0f, dropped, seq);
         }
         
+        seq++;
         sleep(1);
     }
 
     free(icmp_blob);
+    free(resolved);
     freeaddrinfo(hits);
 
     return 0;
