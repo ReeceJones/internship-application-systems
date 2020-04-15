@@ -3,10 +3,14 @@
 #include <getopt.h>
 #include <string.h>
 
+#include <netdb.h>
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <netinet/ip6.h>
 #include <netinet/ip_icmp.h>
+#include <netinet/icmp6.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <errno.h>
@@ -14,7 +18,7 @@
 #define ECHO_SIZE 64
 
 /*
- * References
+ * References:
  * - https://en.wikipedia.org/wiki/Internet_Control_Message_Protocol#Control_messages
  * - https://www.binarytides.com/icmp-ping-flood-code-sockets-c-linux/
  * - http://man7.org/linux/man-pages/man7/raw.7.html
@@ -22,6 +26,7 @@
  * - https://stackoverflow.com/questions/14774668/what-is-raw-socket-in-socket-programming
  * - http://www.rfc-editor.org/ien/ien54.pdf
  * - https://github.com/bminor/newlib/blob/master/newlib/libc/sys/linux/include/netinet/ip.h
+ * - https://en.wikipedia.org/wiki/Ping_(networking_utility)#Echo_request
  */
 
 unsigned short internet_checksum(unsigned short* data, unsigned int len) {
@@ -39,69 +44,153 @@ unsigned short internet_checksum(unsigned short* data, unsigned int len) {
 }
 
 int main(int argc, char** argv) {
-    const char* server = "138.67.48.54";
-    //const char* server = "127.0.0.1";
-    unsigned long server_address = inet_addr(server);
-    if (server_address == INADDR_NONE) {
-        fprintf(stderr, "Invalid Address\n");
+    if (argc <= 1) {
+        fprintf(stderr, "Expected more arguments\n");
         return 1;
     }
-    struct sockaddr_in socket_server_address = { 0 };
-    socket_server_address.sin_family = AF_INET;
-    socket_server_address.sin_addr.s_addr = server_address;
-    socket_server_address.sin_port = htons(0);
-    // create a datagram socket using ICMP protocol
-    int socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
-    if (socket_fd < 0) {
-        fprintf(stderr, "Unable to create socket. Are you running as root?\n");
+    
+    int ip_mode = -1;
+
+    int opt = 0;
+    while ((opt = getopt(argc, argv, "46")) != -1) {
+        switch (opt) {
+            default:
+            case  '?':
+                fprintf(stderr, "Unknown option\n");
+                return 1;
+            case '4':
+                if (ip_mode == -1 || ip_mode == AF_INET) {
+                    ip_mode = AF_INET;
+                }
+                else {
+                    fprintf(stderr, "Option 4 conflicts with 6\n");
+                    return 1;
+                }
+            break;
+            case '6':
+                if (ip_mode == -1 || ip_mode == AF_INET6) {
+                    ip_mode = AF_INET6;
+                }
+                else {
+                    fprintf(stderr, "Option 6 conflicts with 4\n");
+                    return 1;  
+                }
+            break;
+        }
+    }
+
+    if (ip_mode == -1) {
+        ip_mode = AF_INET;
+    }
+
+    if (optind >= argc || optind < argc - 1) {
+        fprintf(stderr, "Expected target\n");
         return 1;
     }
 
-    struct icmphdr* icmp = malloc(sizeof(struct icmphdr) + ECHO_SIZE);
-    if (icmp == NULL) {
+    const char* server = (const char*)argv[optind];
+
+    // Resolve host location
+    struct addrinfo hints = { 0 };
+    hints.ai_socktype = SOCK_DGRAM;
+    //hints.ai_flags = AI_ADDRCONFIG;
+    //hints.ai_family = AF_INET6;
+    hints.ai_family = AF_UNSPEC;
+    struct addrinfo* hits;
+    int err = getaddrinfo(server, NULL, &hints, &hits);
+
+    if (err != 0) {
+        fprintf(stderr, "Could not resolve hostname!"
+                        " Make sure you entered a valid IP/hostname.\n");
+        return 1;
+    }
+
+    struct addrinfo* node = hits;
+
+    char* s = malloc(0xff);
+    while (node != NULL) {
+        memset(s, 0, 0xff);
+        inet_ntop(node->ai_family, &(((struct sockaddr_in6*)node->ai_addr)->sin6_addr), s, 0xff);
+        printf("%s\n", s);
+        node = node->ai_next;
+    }
+    free(s);
+
+    ip_mode = hits->ai_family;
+
+    socklen_t socket_len = hits->ai_addrlen;
+    struct sockaddr* socket_server_address = hits->ai_addr;
+
+    int protocol = ip_mode == AF_INET ? IPPROTO_ICMP : IPPROTO_ICMPV6;
+
+    // create a datagram socket using ICMP protocol
+    int socket_fd = socket(ip_mode, SOCK_DGRAM, protocol);
+    if (socket_fd < 0) {
+        fprintf(stderr, "Unable to create socket: %d.\n", errno);
+        return 1;
+    }
+
+    unsigned int icmp_size = ip_mode == AF_INET ? sizeof(struct icmphdr)
+                             : sizeof(struct icmp6_hdr);
+    icmp_size += ECHO_SIZE;
+
+    void* icmp_blob = malloc(icmp_size);
+    if (icmp_blob == NULL) {
         fprintf(stderr, "Failed to allocate memory for outgoing icmp\n");
         close(socket_fd);
         return 1;
     }
 
     unsigned long seq = 1;
+    unsigned long dropped = 0;
     while (1) {
-        memset(icmp, 0, sizeof(struct icmphdr) + ECHO_SIZE);
+        memset(icmp_blob, 0, icmp_size);
 
-        icmp->type = ICMP_ECHO;
-        icmp->code = 0;
-        icmp->un.echo.sequence = seq++;
-        icmp->un.echo.id = getpid();
-        icmp->checksum = 0;
-        icmp->checksum = internet_checksum((unsigned short*)icmp,
-                                           sizeof(struct icmphdr));
-        int err = sendto(socket_fd, (void*)icmp, sizeof(struct icmphdr) + ECHO_SIZE,
-                         0,(struct sockaddr*)&socket_server_address,
-                         sizeof(struct sockaddr_in));
+        if (ip_mode == AF_INET) {
+            struct icmphdr* icmp = (struct icmphdr*)icmp_blob;
+            icmp->type = ICMP_ECHO;
+            icmp->code = 0;
+            icmp->un.echo.sequence = seq;
+            icmp->un.echo.id = getpid();
+            icmp->checksum = 0;
+            //icmp->checksum = internet_checksum((unsigned short*)icmp_blob, icmp_size);
+        }
+        else {
+            struct icmp6_hdr* icmp6 = (struct icmp6_hdr*)icmp_blob;
+            icmp6->icmp6_type = ICMP6_ECHO_REQUEST;
+            icmp6->icmp6_code = 0;
+            icmp6->icmp6_dataun.icmp6_un_data16[0] = getpid();
+            icmp6->icmp6_dataun.icmp6_un_data16[1] = seq;
+            icmp6->icmp6_cksum = 0;
+            //icmp6->icmp6_cksum = internet_checksum((unsigned short*)icmp_blob, icmp_size);
+        }
+        err = sendto(socket_fd, icmp_blob, icmp_size, 0, socket_server_address, socket_len);
         if (err <= 0) {
             fprintf(stderr, "Failed to send ICMP request: %d\n", errno);
-            close(socket_fd);
-            free(icmp);
-            return 1;
+            // Failed to send packet. Likely an issue on our end, so just continue.
+            sleep(1);
+            continue;
         }
-
-        printf("Sent %d bytes\n", err);
 
         struct sockaddr incoming_addr = { 0 };
-        socklen_t size = sizeof(struct sockaddr);
-        err = recvfrom(socket_fd, icmp, sizeof(struct icmphdr) + ECHO_SIZE,
-                       0, &incoming_addr, &size);
-        if (err < 0) {
+        socklen_t size = socket_len;
+        err = recvfrom(socket_fd, icmp_blob, icmp_size, 0, &incoming_addr, &size);
+        if (err <= 0) {
             fprintf(stderr, "Failed to receive ICMP message: %d\n", errno);
-            close(socket_fd);
-            free(icmp);
-            return 1;
+            // If we didn't hear a response, that likely means the packet didn't make it.
+            dropped++;
         }
-        printf("Received %d bytes\n", err);
-        printf("%d\n", icmp->type);
+        else {
+            printf("%d bytes received from %s -> %s. "
+                   "icmp_seq=%ld time=%.4f dropped=%ld\\%ld\n",
+                    err, server, server, seq++, 1.0f, dropped, dropped);
+        }
         
         sleep(1);
     }
+
+    free(icmp_blob);
+    freeaddrinfo(hits);
 
     return 0;
 }
