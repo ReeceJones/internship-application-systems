@@ -2,13 +2,9 @@
 #include <stdlib.h>
 #include <getopt.h>
 #include <string.h>
-
+#include <time.h>
 #include <netdb.h>
-#include <sys/types.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/ip.h>
-#include <netinet/ip6.h>
 #include <netinet/ip_icmp.h>
 #include <netinet/icmp6.h>
 #include <arpa/inet.h>
@@ -51,9 +47,9 @@ int main(int argc, char** argv) {
     int strict_recv = 0;
     int local_check = 0;
     unsigned long payload_size = 64;
-
+    unsigned char ttl = 55;
     int opt = 0;
-    while ((opt = getopt(argc, argv, "46csp:h")) != -1) {
+    while ((opt = getopt(argc, argv, "46csp:t:h")) != -1) {
         switch (opt) {
             default:
             case  '?':
@@ -84,7 +80,10 @@ int main(int argc, char** argv) {
                 strict_recv = 1;
             break;
             case 'p':
-                payload_size = atoi(optarg);
+                payload_size = atol(optarg);
+            break;
+            case 't':
+                ttl = atoi(optarg);
             break;
             case 'h':
                 printf("Usage: pingeroo [options] <hostname or ip address>\n"
@@ -93,7 +92,8 @@ int main(int argc, char** argv) {
                        "\t-6 - Use ipv6 only\n"
                        "\t-c - Manually calculate checksum (Likely useless)\n"
                        "\t-s - Strict packet drop mode. If the number of packets received isn't the same as the number of packets sent, that sequence is considered dropped\n"
-                       "\t-p <size> - Specify a custom payload size for ping request\n");                
+                       "\t-p <size> - Specify a custom payload size for ping request\n"
+                       "\t-t <ttl> - Specify a custom ttl (55 by default)\n");                
             break;
         }
     }
@@ -163,6 +163,16 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // set  TTL for socket
+    err = setsockopt(socket_fd, SOL_IP, IP_TTL, &ttl, sizeof(ttl));
+    if (err != 0) {
+        fprintf(stderr, "Failed to set TTL for socket: %d\n", errno);
+        freeaddrinfo(hits);
+        free(resolved);
+        close(socket_fd);
+        return 1;
+    }
+
     unsigned int icmp_size = ip_mode == AF_INET ? sizeof(struct icmphdr)
                              : sizeof(struct icmp6_hdr);
     icmp_size += payload_size;
@@ -178,6 +188,8 @@ int main(int argc, char** argv) {
 
     unsigned long seq = 1;
     unsigned long dropped = 0;
+    struct timespec send_time = { 0 };
+    struct timespec recv_time = { 0 }; 
     while (1) {
         memset(icmp_blob, 0, icmp_size);
 
@@ -210,8 +222,14 @@ int main(int argc, char** argv) {
             sleep(1);
             continue;
         }
-
         int sent = err;
+
+        err = clock_gettime(CLOCK_MONOTONIC, &send_time);
+        if (err != 0) {
+            fprintf(stderr, "Failed to get clock time: %d\n", errno);
+            sleep(1);
+            continue;
+        }
 
         struct sockaddr incoming_addr = { 0 };
         socklen_t size = socket_len;
@@ -222,13 +240,40 @@ int main(int argc, char** argv) {
             dropped++;
         }
         else {
+            int recv = err;
+            if (ip_mode == AF_INET) {
+                struct icmphdr* icmp = (struct icmphdr*)icmp_blob;
+                if (icmp->type == ICMP_TIME_EXCEEDED) {
+                    printf("Time Exceeded\n");
+                    sleep(1);
+                    continue;
+                }
+            }
+            else {
+                struct icmp6_hdr* icmp6 = (struct icmp6_hdr*)icmp_blob;
+                if (icmp6->icmp6_type == ICMP6_TIME_EXCEEDED) {
+                    printf("Time Exceeded\n");
+                    sleep(1);
+                    continue;
+                }
+            }
+
             if (strict_recv && sent != err) {
                 printf("(Data length mismatch: sent: %d recv: %d) ", sent, err);
                 dropped++;
             }
+            err = clock_gettime(CLOCK_MONOTONIC, &recv_time);
+            if (err != 0) {
+                fprintf(stderr, "Failed to get clock time: %d\n", errno);
+                sleep(1);
+                continue;
+            }
+
             printf("%d bytes received from %s -> %s; "
-                   "icmp_seq=%ld time=%.4f dropped=%ld\\%ld\n",
-                    err, server, resolved, seq, 1.0f, dropped, seq);
+                   "icmp_seq=%ld time=%.4fms dropped=%ld\\%ld\n",
+                    recv, server, resolved, seq,
+                    (double)(recv_time.tv_sec - send_time.tv_sec) * 1000.0
+                    + (double)(recv_time.tv_nsec - send_time.tv_nsec) / 1000000.0, dropped, seq);
         }
         
         seq++;
