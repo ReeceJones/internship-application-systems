@@ -23,6 +23,8 @@
  * - http://www.rfc-editor.org/ien/ien54.pdf
  * - https://github.com/bminor/newlib/blob/master/newlib/libc/sys/linux/include/netinet/ip.h
  * - https://en.wikipedia.org/wiki/Ping_(networking_utility)#Echo_request
+ * - https://www.geeksforgeeks.org/ping-in-c/
+ * - Various linux man pages
  */
 
 unsigned short internet_checksum(unsigned short* data, unsigned int len) {
