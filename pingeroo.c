@@ -67,7 +67,7 @@ int main(int argc, char** argv) {
 
     unsigned long seq = 1;
     while (1) {
-        memset(icmp, 0, sizeof(struct icmphdr));
+        memset(icmp, 0, sizeof(struct icmphdr) + ECHO_SIZE);
 
         icmp->type = ICMP_ECHO;
         icmp->code = 0;
