@@ -39,7 +39,7 @@ unsigned short internet_checksum(unsigned short* data, unsigned int len) {
 }
 
 int main(int argc, char** argv) {
-    const char* server = "138.68.48.54";
+    const char* server = "138.67.48.54";
     //const char* server = "127.0.0.1";
     unsigned long server_address = inet_addr(server);
     if (server_address == INADDR_NONE) {
@@ -50,9 +50,8 @@ int main(int argc, char** argv) {
     socket_server_address.sin_family = AF_INET;
     socket_server_address.sin_addr.s_addr = server_address;
     socket_server_address.sin_port = htons(0);
-    // socket_server_address.sin_port = htons(0);
     // create a datagram socket using ICMP protocol
-    int socket_fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    int socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
     if (socket_fd < 0) {
         fprintf(stderr, "Unable to create socket. Are you running as root?\n");
         return 1;
