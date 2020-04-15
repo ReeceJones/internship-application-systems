@@ -53,7 +53,7 @@ int main(int argc, char** argv) {
     unsigned long payload_size = 64;
 
     int opt = 0;
-    while ((opt = getopt(argc, argv, "46csp:")) != -1) {
+    while ((opt = getopt(argc, argv, "46csp:h")) != -1) {
         switch (opt) {
             default:
             case  '?':
@@ -86,11 +86,20 @@ int main(int argc, char** argv) {
             case 'p':
                 payload_size = atoi(optarg);
             break;
+            case 'h':
+                printf("Usage: pingeroo [options] <hostname or ip address>\n"
+                       "\t-h - Display this page\n"
+                       "\t-4 - Use ipv4 only\n"
+                       "\t-6 - Use ipv6 only\n"
+                       "\t-c - Manually calculate checksum (Likely useless)\n"
+                       "\t-s - Strict packet drop mode. If the number of packets received isn't the same as the number of packets sent, that sequence is considered dropped\n"
+                       "\t-p <size> - Specify a custom payload size for ping request\n");                
+            break;
         }
     }
 
     if (optind >= argc || optind < argc - 1) {
-        fprintf(stderr, "Expected target\n");
+        fprintf(stderr, "Bad arguments: use -h to see options\n");
         return 1;
     }
 
@@ -99,8 +108,6 @@ int main(int argc, char** argv) {
     // Resolve host location
     struct addrinfo hints = { 0 };
     hints.ai_socktype = SOCK_DGRAM;
-    //hints.ai_flags = AI_ADDRCONFIG;
-    //hints.ai_family = AF_INET6;
     hints.ai_family = AF_UNSPEC;
     struct addrinfo* hits;
     int err = getaddrinfo(server, NULL, &hints, &hits);
